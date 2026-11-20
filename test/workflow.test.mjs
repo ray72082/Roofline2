@@ -81,3 +81,45 @@ test("two independent companies, receptionist, bookings, follow-up and signed bi
   }
   assert.equal((await workspace(a)).jobs[0].status,"simulated");
 });
+
+test("company ownership survives process restart", {timeout:10000}, async t => {
+  const {mkdtemp,rm} = await import("node:fs/promises");
+  const {tmpdir} = await import("node:os");
+  const {join} = await import("node:path");
+  const directory = await mkdtemp(join(tmpdir(),"roofline-test-"));
+  const children = new Set();
+  t.after(async () => {
+    for (const child of children) {
+      child.kill();
+      await once(child,"exit");
+    }
+    await rm(directory,{recursive:true,force:true});
+  });
+  async function launch() {
+    const child = spawn(process.execPath,["server.mjs"],{env:{...process.env,HOST:"127.0.0.1",PORT:"0",
+      ROOFLINE_DB:join(directory,"test.sqlite")}});
+    children.add(child);
+    child.once("exit",()=>children.delete(child));
+    const [ready] = await Promise.race([
+      once(child.stdout,"data"),once(child.stderr,"data").then(([message])=>{throw new Error(message.toString());})
+    ]);
+    return {child,url:"http://127.0.0.1:"+ready.toString().match(/listening on (\d+)/)[1]};
+  }
+  const first = await launch();
+  const register = await fetch(first.url+"/account",{method:"POST",body:JSON.stringify({
+    email:"owner@example.test",password:"durable test password",register:true
+  })});
+  assert.equal(register.status,200);
+  const cookie = register.headers.get("set-cookie").split(";")[0];
+  const created = await fetch(first.url+"/account",{method:"POST",headers:{cookie},body:JSON.stringify({
+    name:"Durable Service",industry:"Maintenance"
+  })});
+  assert.equal(created.status,200);
+  const {id} = await created.json();
+  first.child.kill();
+  await once(first.child,"exit");
+  const second = await launch();
+  const response = await fetch(second.url+"/api/"+id+"/workspace",{headers:{cookie}});
+  assert.equal(response.status,200);
+  assert.equal((await response.json()).name,"Durable Service");
+});
